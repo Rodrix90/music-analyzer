@@ -329,7 +329,12 @@ async function startAnalysis() {
 // ── DSP ────────────────────────────────────────────────
 async function analyzeAudio(buf) {
   const sr  = buf.sampleRate;
-  const raw = buf.getChannelData(0);
+  // Mezcla mono de todos los canales para evitar sesgos de un canal aislado.
+  const raw = new Float32Array(buf.length);
+  for (let ch=0;ch<buf.numberOfChannels;ch++) {
+    const channel=buf.getChannelData(ch);
+    for(let i=0;i<raw.length;i++) raw[i]+=channel[i]/buf.numberOfChannels;
+  }
   const fac = Math.round(sr / 22050) || 1;
   const data = [];
   for (let i = 0; i < raw.length; i += fac) data.push(raw[i]);
@@ -344,6 +349,7 @@ async function analyzeAudio(buf) {
     mode:     keyRes.mode,
     camelot:  toCamelot(keyRes.key, keyRes.mode),
     confidence: keyRes.confidence,
+    uncertain: keyRes.uncertain,
     keyCandidates: keyRes.candidates,
     tempo:    tempoLabel(bpm),
     duration: Math.round(buf.duration),
@@ -451,32 +457,65 @@ function keyCandidates(chroma){
   }
   return results.sort((a,b)=>b.score-a.score);
 }
-function detectKey(s,sr){
-  const N=8192,hop=4096, chroma=new Float64Array(12), sections=[];
-  let local=new Float64Array(12), frames=0;
-  const maxFrames=750, total=Math.max(0,Math.floor((s.length-N)/hop)+1), stride=Math.max(1,Math.ceil(total/maxFrames));
-  for(let off=0;off+N<=s.length;off+=hop*stride){
-    const mag=fftMagnitude(s.slice(off,off+N));const c=new Float64Array(12);
-    // Focus on pitched midrange; suppress isolated transients via log compression.
-    for(let bin=1;bin<mag.length-1;bin++){
-      const freq=bin*sr/N;if(freq<65||freq>2100)continue;
-      if(mag[bin]<mag[bin-1]||mag[bin]<mag[bin+1])continue;
-      const midi=69+12*Math.log2(freq/440), nearest=Math.round(midi);
-      if(Math.abs(midi-nearest)>0.28)continue;
-      c[((nearest%12)+12)%12]+=Math.log1p(mag[bin]);
+// Perfil armónico: se puntúa cada fundamental usando sus armónicos y se
+// resta energía de subarmónicos para reducir la confusión por sobretonos.
+function framePitchChroma(mag,sr,N){
+  const out=new Float64Array(12), fundamentals=new Float64Array(12);
+  for(let midi=36;midi<=84;midi++){
+    const f=440*Math.pow(2,(midi-69)/12);
+    let harmonic=0,weight=0;
+    for(let h=1;h<=5;h++){
+      const bin=f*h*N/sr;if(bin>=mag.length-2)break;
+      const idx=Math.round(bin);
+      const amp=Math.max(mag[idx-1]||0,mag[idx]||0,mag[idx+1]||0);
+      const w=1/Math.pow(h,0.9);harmonic+=w*Math.sqrt(amp);weight+=w;
     }
-    const sum=c.reduce((a,b)=>a+b,0);if(sum<1e-8)continue;
-    for(let i=0;i<12;i++){local[i]+=c[i]/sum;chroma[i]+=c[i]/sum;}
-    frames++;
-    if(frames%24===0){sections.push(keyCandidates(local)[0]);local=new Float64Array(12);}
+    const idx=Math.round(f*N/sr);
+    const fundamental=Math.sqrt(Math.max(mag[idx-1]||0,mag[idx]||0,mag[idx+1]||0));
+    const value=(harmonic/Math.max(weight,0.001))*(0.65+0.35*Math.min(1,fundamental/Math.max(0.01,harmonic/weight)));
+    out[midi%12]+=value;
+    fundamentals[midi%12]+=fundamental;
   }
-  if(frames%24!==0&&frames>0)sections.push(keyCandidates(local)[0]);
-  const candidates=keyCandidates(chroma), best=candidates[0];
-  const margin=Math.max(0,best.score-(candidates[1]?.score??0));
-  const agreement=sections.length?sections.filter(x=>x.key===best.key&&x.mode===best.mode).length/sections.length:0;
-  // A relative indicator, not a calibrated probability.
-  const confidence=Math.round(Math.min(100,Math.max(0,100*(0.55*agreement+0.45*Math.min(1,margin/0.15)))));
-  return {key:best.key,mode:best.mode,confidence,candidates:candidates.slice(0,3),sections:sections.length};
+  const sum=out.reduce((x,y)=>x+y,0);
+  if(sum>0)for(let i=0;i<12;i++)out[i]/=sum;
+  return out;
+}
+function detectKey(s,sr){
+  const N=8192,hop=4096,total=Math.max(0,Math.floor((s.length-N)/hop)+1);
+  const stride=Math.max(1,Math.ceil(total/650));
+  const global=new Float64Array(12), segments=[], segment=new Float64Array(12);
+  let frames=0,segmentFrames=0;
+  // Secciones de ~12 s: la armonía se estima localmente, no sólo por volumen global.
+  const segmentTarget=Math.max(6,Math.round(12*sr/(hop*stride)));
+  for(let off=0;off+N<=s.length;off+=hop*stride){
+    const frame=s.slice(off,off+N);
+    let rms=0;for(let i=0;i<N;i+=8)rms+=frame[i]*frame[i];
+    if(rms<0.00001)continue;
+    const chroma=framePitchChroma(fftMagnitude(frame),sr,N);
+    for(let i=0;i<12;i++){global[i]+=chroma[i];segment[i]+=chroma[i];}
+    frames++;segmentFrames++;
+    if(segmentFrames>=segmentTarget){segments.push(Array.from(segment,x=>x/segmentFrames));segment.fill(0);segmentFrames=0;}
+  }
+  if(segmentFrames>=3)segments.push(Array.from(segment,x=>x/segmentFrames));
+  if(!frames)return {key:'C',mode:'major',confidence:0,candidates:[],uncertain:true};
+  const avg=Array.from(global,x=>x/frames);
+  const globalCandidates=keyCandidates(avg);
+  // Voto suave por segmentos, penalizando resultados inestables.
+  const localScores=segments.map(c=>keyCandidates(c));
+  const ranked=globalCandidates.map(candidate=>{
+    const local=localScores.length?localScores.reduce((acc,list)=>{
+      const found=list.find(x=>x.key===candidate.key&&x.mode===candidate.mode);
+      return acc+(found?found.score:0);
+    },0)/localScores.length:candidate.score;
+    return {...candidate,score:0.7*candidate.score+0.3*local};
+  }).sort((a,b)=>b.score-a.score);
+  const best=ranked[0],runner=ranked[1];
+  const margin=best.score-(runner?.score??0);
+  const agreement=localScores.length?localScores.filter(list=>list[0]?.key===best.key&&list[0]?.mode===best.mode).length/localScores.length:0;
+  const confidence=Math.round(100*Math.max(0,Math.min(1,0.55*agreement+0.45*Math.max(0,margin)/0.16)));
+  // Nunca presentar una decisión débil como una certeza.
+  const uncertain=confidence<48||margin<0.035;
+  return {key:best.key,mode:best.mode,confidence,candidates:ranked.slice(0,3),uncertain,sections:segments.length};
 }
 
 const CAM = {
@@ -655,7 +694,7 @@ function render(dsp, ai) {
     const o=document.createElement('option');o.value=note+' '+mode;o.textContent=note+' '+(mode==='major'?'major':'minor');sel.appendChild(o);
   }
   sel.value=dsp.key+' '+dsp.mode;
-  document.getElementById('keyConfidence').textContent='Indicador de consistencia: '+dsp.confidence+'/100 (no es probabilidad de acierto)';
+  document.getElementById('keyConfidence').textContent=(dsp.uncertain?'⚠ Tonalidad incierta — revisá las alternativas. ':'')+'Indicador de consistencia: '+dsp.confidence+'/100 (no es probabilidad de acierto)';
   document.getElementById('keyAlternatives').textContent='Candidatas: '+(dsp.keyCandidates||[]).map(x=>x.key+' '+x.mode+' ('+x.score.toFixed(2)+')').join(' · ');
 
   tags('aiStyle', ai.style || [], 'ts');
@@ -679,7 +718,7 @@ function updateUdioKey(){
   let style=ai.udio_style||[...(ai.style||[]),...(ai.instruments||[]),ai.voice_type||''].filter(Boolean).join(', ');
   // Remove any AI-supplied key, Camelot and tempo before adding verified local values.
   style=style.split(',').map(x=>x.trim()).filter(x=>x&&!/^(?:[A-G](?:#|b)?\s+(?:major|minor)|\d+(?:\.\d+)?\s*BPM|(?:[1-9]|1[0-2])[AB])$/i.test(x)).join(', ');
-  document.getElementById('udioStyle').textContent=[style,selected,dsp.bpm+' BPM',dsp.tempo].filter(Boolean).join(', ');
+  document.getElementById('udioStyle').textContent=[style,...(dsp.uncertain&&selected===dsp.key+' '+dsp.mode?[]:[selected]),dsp.bpm+' BPM',dsp.tempo].filter(Boolean).join(', ');
 }
 
 function renderUdioLyrics(lyrics) {
